@@ -597,6 +597,7 @@ def main(cfg):
             num_tasks=num_tasks,
             gamma=cfg.hyperparameters.gamma,
             device=device,
+            g_max=cfg.hyperparameters.vmax,
         )
     else:
         reward_normalizer = None
