@@ -296,6 +296,7 @@ class Actor(nn.Module):
         use_norm=True,
         layers=2,
         min_std=0.1,
+        num_tasks=1,
         device=None,
     ):
         super().__init__()
@@ -310,15 +311,26 @@ class Actor(nn.Module):
             layers=layers,
             device=device,
         )
-        self.log_temp = nn.Parameter(
-            torch.log(torch.tensor(ent_start, device=device, dtype=torch.float32))
-        )
-        self.log_lagrange = nn.Parameter(
-            torch.log(torch.tensor(kl_start, device=device, dtype=torch.float32))
-        )
+        self.num_tasks = num_tasks
+        _log_ent = torch.tensor(ent_start, dtype=torch.float32).log().item()
+        _log_kl = torch.tensor(kl_start, dtype=torch.float32).log().item()
+        if num_tasks > 1:
+            self.log_temp = nn.Parameter(
+                torch.full((num_tasks,), _log_ent, device=device, dtype=torch.float32)
+            )
+            self.log_lagrange = nn.Parameter(
+                torch.full((num_tasks,), _log_kl, device=device, dtype=torch.float32)
+            )
+        else:
+            self.log_temp = nn.Parameter(
+                torch.tensor(_log_ent, device=device, dtype=torch.float32)
+            )
+            self.log_lagrange = nn.Parameter(
+                torch.tensor(_log_kl, device=device, dtype=torch.float32)
+            )
         self.min_std = min_std
 
-    def forward(self, obs: torch.Tensor) -> torch.distributions.Distribution:
+    def forward(self, obs: torch.Tensor, task_ids=None) -> torch.distributions.Distribution:
         x = self.model(obs)
         mean, log_std = torch.split(x, x.shape[-1] // 2, dim=-1)
         std = torch.exp(log_std) + self.min_std
@@ -327,11 +339,16 @@ class Actor(nn.Module):
         transformed_pi = torch.distributions.TransformedDistribution(
             pi, [torch.distributions.TanhTransform()]
         )
+        temperature = torch.exp(self.log_temp)
+        beta = torch.exp(self.log_lagrange)
+        if task_ids is not None and self.num_tasks > 1:
+            temperature = temperature[task_ids]
+            beta = beta[task_ids]
         return (
             transformed_pi,
             torch.tanh(mean),
-            torch.exp(self.log_temp),
-            torch.exp(self.log_lagrange),
+            temperature,
+            beta,
         )
 
 

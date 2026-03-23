@@ -1,3 +1,13 @@
+from __future__ import annotations
+
+try:
+    # Required for avoiding IsaacGym import error
+    # Both isaacgym and isaacgymenvs must be imported before torch
+    import isaacgym
+    import isaacgymenvs
+except ImportError:
+    pass
+
 from dataclasses import dataclass, replace
 import functools
 import os
@@ -12,13 +22,12 @@ from omegaconf import DictConfig, OmegaConf
 
 import wandb
 
-from src.torchrl.reppo_util import EmpiricalNormalization, hl_gauss
-
-try:
-    # Required for avoiding IsaacGym import error
-    import isaacgym
-except ImportError:
-    pass
+from src.torchrl.reppo_util import (
+    EmpiricalNormalization,
+    PerTaskEmpiricalNormalization,
+    PerTaskRewardNormalizer,
+    hl_gauss,
+)
 
 import hydra
 import torch
@@ -43,7 +52,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
 
 
-@dataclass(slots=True)
+@dataclass()
 class TrainState:
     device: torch.device
     obs: torch.Tensor
@@ -56,6 +65,7 @@ class TrainState:
     actor_optimizer: optim.Optimizer
     critic_optimizer: optim.Optimizer
     scaler: GradScaler
+    reward_normalizer: nn.Module = None
 
     def compile(self):
         self.actor.compile()
@@ -88,6 +98,8 @@ def get_autocast_context(cfg: DictConfig):
 def make_collect_fn(cfg: DictConfig, env):
     autocast = get_autocast_context(cfg)
     asymmetric_obs = env.asymmetric_obs
+    multi_task = cfg.env.type == "mtbench"
+    per_task_norm = multi_task and cfg.hyperparameters.normalize_env
 
     def collect_fn(
         train_state: TrainState,
@@ -96,26 +108,37 @@ def make_collect_fn(cfg: DictConfig, env):
         info_list = []
         obs = train_state.obs
         critic_obs = train_state.critic_obs
+        task_ids = env.task_indices.long() if multi_task else None
 
         for _ in range(cfg.hyperparameters.num_steps):
             with autocast():
-                norm_obs = train_state.normalizer(obs)
-                norm_critic_obs = train_state.critic_normalizer(critic_obs)
-                with torch.inference_mode():
-                    pi, _, _, _ = train_state.actor(norm_obs)
+                if per_task_norm:
+                    norm_obs = train_state.normalizer(obs, task_ids)
+                    norm_critic_obs = train_state.critic_normalizer(critic_obs, task_ids)
+                else:
+                    norm_obs = train_state.normalizer(obs)
+                    norm_critic_obs = train_state.critic_normalizer(critic_obs)
+                with torch.no_grad():
+                    pi, _, _, _ = train_state.actor(norm_obs, task_ids)
                     actions = pi.sample()
 
-            next_obs, rewards, dones, truncations, infos = env.step(actions)
+            next_obs, rewards, dones, infos = env.step(actions)
+            truncations = infos["time_outs"]
+
+            # Per-task reward normalization
+            if multi_task and train_state.reward_normalizer is not None:
+                with torch.no_grad():
+                    train_state.reward_normalizer.update_stats(
+                        rewards, dones.float(), task_ids
+                    )
+                    rewards = train_state.reward_normalizer(rewards, task_ids)
 
             if asymmetric_obs:
                 next_critic_obs = infos["observations"]["critic"]
             else:
                 next_critic_obs = next_obs
 
-            with (
-                torch.inference_mode(),
-                autocast(),
-            ):
+            with torch.no_grad(), autocast():
                 if (
                     cfg.env.get("has_final_obs", False)
                     and cfg.env.get("partial_reset", False)
@@ -126,13 +149,21 @@ def make_collect_fn(cfg: DictConfig, env):
                 else:
                     _next_obs = next_obs
                     _next_critic_obs = next_critic_obs
-                norm_next_obs = train_state.normalizer(_next_obs)
-                next_pi, _, temperature, _ = train_state.actor(norm_next_obs)
+                if per_task_norm:
+                    norm_next_obs = train_state.normalizer(_next_obs, task_ids)
+                else:
+                    norm_next_obs = train_state.normalizer(_next_obs)
+                next_pi, _, temperature, _ = train_state.actor(norm_next_obs, task_ids)
                 next_actions = next_pi.sample()
                 next_log_probs = next_pi.log_prob(
                     next_actions.clip(-1 + 1e-6, 1 - 1e-6)
                 ).sum(-1)
-                norm_next_critic_obs = train_state.critic_normalizer(_next_critic_obs)
+                if per_task_norm:
+                    norm_next_critic_obs = train_state.critic_normalizer(
+                        _next_critic_obs, task_ids
+                    )
+                else:
+                    norm_next_critic_obs = train_state.critic_normalizer(_next_critic_obs)
                 next_value, _, _, next_embedding = train_state.critic(
                     norm_next_critic_obs, next_actions
                 )
@@ -140,21 +171,21 @@ def make_collect_fn(cfg: DictConfig, env):
                     rewards - cfg.hyperparameters.gamma * next_log_probs * temperature
                 )
 
+            td_dict = {
+                "observations": norm_obs,
+                "critic_observations": norm_critic_obs,
+                "actions": actions,
+                "log_probs": pi.log_prob(actions.clip(-0.999, 0.999)).sum(-1),
+                "rewards": rewards.unsqueeze(-1),
+                "next_embeddings": next_embedding,
+                "next_values": next_value.unsqueeze(-1),
+                "dones": dones.unsqueeze(-1).float(),
+                "truncations": truncations.unsqueeze(-1).float(),
+            }
+            if multi_task:
+                td_dict["task_indices"] = task_ids
             transitions.append(
-                TensorDict(
-                    {
-                        "observations": norm_obs,
-                        "critic_observations": norm_critic_obs,
-                        "actions": actions,
-                        "log_probs": pi.log_prob(actions.clip(-0.999, 0.999)).sum(-1),
-                        "rewards": rewards.unsqueeze(-1),
-                        "next_embeddings": next_embedding,
-                        "next_values": next_value.unsqueeze(-1),
-                        "dones": dones.unsqueeze(-1).float(),
-                        "truncations": truncations.unsqueeze(-1).float(),
-                    },
-                    batch_size=(env.num_envs,),
-                )
+                TensorDict(td_dict, batch_size=(env.num_envs,))
             )
             info_list.append(infos)
             obs = next_obs
@@ -171,6 +202,8 @@ def make_collect_fn(cfg: DictConfig, env):
 
 
 def make_postprocess_fn(cfg: DictConfig, env):
+    multi_task = cfg.env.type == "mtbench"
+
     @torch.compiler.disable()
     def compute_gve(rewards, dones, truncated, next_values, device: torch.device):
         gves = []
@@ -198,18 +231,22 @@ def make_postprocess_fn(cfg: DictConfig, env):
         )
 
         # Flatten all time and environment dimensions into a single batch dimension
+        data_dict = {
+            "observations": transition["observations"],
+            "critic_observations": transition["critic_observations"],
+            "actions": transition["actions"],
+            "rewards": transition["rewards"],
+            "next_embeddings": transition["next_embeddings"],
+            "next_values": transition["next_values"],
+            "dones": transition["dones"],
+            "truncations": transition["truncations"],
+            "gve": torch.stack(gve),
+        }
+        if multi_task:
+            data_dict["task_indices"] = transition["task_indices"]
+
         data = TensorDict(
-            {
-                "observations": transition["observations"],
-                "critic_observations": transition["critic_observations"],
-                "actions": transition["actions"],
-                "rewards": transition["rewards"],
-                "next_embeddings": transition["next_embeddings"],
-                "next_values": transition["next_values"],
-                "dones": transition["dones"],
-                "truncations": transition["truncations"],
-                "gve": torch.stack(gve),
-            },
+            data_dict,
             batch_size=(
                 cfg.hyperparameters.num_steps,
                 cfg.hyperparameters.num_envs,
@@ -295,16 +332,18 @@ def make_actor_update_fn(cfg: DictConfig, train_state: TrainState):
         actor_optimizer = train_state.actor_optimizer
         scaler = train_state.scaler
         critic_obs = data["critic_observations"]
+        task_ids = data["task_indices"].long() if "task_indices" in data.keys() else None
         with autocast():
-            pi, _, temperature, beta = actor(data["observations"])
+            pi, _, temperature, beta = actor(data["observations"], task_ids)
             actions = pi.rsample()
             log_probs = pi.log_prob(actions.clip(-1 + 1e-6, 1 - 1e-6)).sum(-1)
             entropy = -log_probs
             qf, _, _, _ = qnet(critic_obs, actions)
+
             actor_loss = -qf + temperature.detach() * log_probs
 
             # compute KL
-            old_pi, _, _, _ = old_actor(data["observations"])
+            old_pi, _, _, _ = old_actor(data["observations"], task_ids)
             old_pi_actions = old_pi.sample((16,)).clip(-1 + 1e-6, 1 - 1e-6)
             old_log_probs = old_pi.log_prob(old_pi_actions).sum(-1).mean(0)
             new_pi_log_probs = pi.log_prob(old_pi_actions).sum(-1).mean(0)
@@ -325,15 +364,14 @@ def make_actor_update_fn(cfg: DictConfig, train_state: TrainState):
                     f"Unknown actor kl clip mode: {cfg.hyperparameters.actor_kl_clip_mode}"
                 )
 
-            # temperature updates
             target_entropy = (
                 actions.shape[-1] * cfg.hyperparameters.ent_target_mult
-            )  # -0.5 * np.prod(envs.action_space.shape)
-            entropy_loss = (target_entropy + entropy).detach().mean() * temperature
+            )
+            entropy_loss = ((target_entropy + entropy).detach() * temperature).mean()
 
             lagrangian_loss = (
-                -beta * (kl - cfg.hyperparameters.kl_bound).mean().detach()
-            )
+                -beta * (kl - cfg.hyperparameters.kl_bound).detach()
+            ).mean()
 
             actor_loss = (actor_loss + entropy_loss + lagrangian_loss).mean()
 
@@ -362,8 +400,10 @@ def make_actor_update_fn(cfg: DictConfig, train_state: TrainState):
 
 def make_evaluate_fn(cfg: DictConfig, eval_envs):
     autocast = get_autocast_context(cfg)
+    multi_task = cfg.env.type == "mtbench"
+    per_task_norm = multi_task and cfg.hyperparameters.normalize_env
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def evaluate(
         train_state: TrainState, stochastic_eval: bool = False
     ) -> tuple[int | float | bool, int | float | bool]:
@@ -374,22 +414,47 @@ def make_evaluate_fn(cfg: DictConfig, eval_envs):
         done_masks = torch.zeros(
             num_eval_envs, dtype=torch.bool, device=train_state.device
         )
+        task_ids = eval_envs.task_indices.long() if multi_task else None
+
         if cfg.env.type == "isaaclab" or cfg.env.asymmetric_obs:
             obs, _ = eval_envs.reset(random_start_init=False)
+        elif cfg.env.type == "mtbench":
+            obs = eval_envs.reset()
+            eval_envs.env.reset_idx(torch.arange(num_eval_envs, device=train_state.device))
+            # call compute observations to refresh physics tensors and then call env reset to get observations
+            eval_envs.env.compute_observations()
+            obs = eval_envs.reset()
+
+            if isinstance(obs, dict):
+                obs = obs['obs']
+
+            # reset logging from before evaluate was called
+            eval_envs.env.cumulatives['reward'][:] = 0
+            eval_envs.env.cumulatives['success'][:] = 0
+
+            success_count_per_episode = torch.zeros(num_eval_envs, device=train_state.device)
         else:
-            obs, _ = eval_envs.reset()
+            obs = eval_envs.reset()
 
         # Run for a fixed number of steps
         for i in range(eval_envs.max_episode_steps):
             with autocast():
-                obs = train_state.normalizer(obs)
-                action_dist, det_actions, _, _ = train_state.actor(obs)
+                if per_task_norm:
+                    obs = train_state.normalizer(obs, task_ids)
+                else:
+                    obs = train_state.normalizer(obs)
+                action_dist, det_actions, _, _ = train_state.actor(obs, task_ids)
             if stochastic_eval:
                 actions = action_dist.sample()
             else:
                 actions = det_actions
 
-            next_obs, rewards, dones, _, infos = eval_envs.step(actions)
+            next_obs, rewards, dones, infos = eval_envs.step(actions)
+            truncations = infos["time_outs"]
+
+            if cfg.env.type == "mtbench":
+                if 'episode' in infos:
+                    success_count_per_episode = infos['episode']['success_count_per_episode']
 
             episode_returns = torch.where(
                 ~done_masks, episode_returns + rewards, episode_returns
@@ -412,6 +477,25 @@ def make_evaluate_fn(cfg: DictConfig, eval_envs):
                 "success": infos["log_info"]["success"].float().mean(),
                 "return": episode_returns.mean().item(),
             }
+        elif cfg.env.type == "mtbench":
+            info = {}
+            task_list = eval_envs.task_list
+            for task_idx in torch.unique(eval_envs.task_indices):
+                remapped = task_idx.item()
+                real_id = task_list[remapped]
+                # Find all parallel environments that correspond to this task
+                task_env_indices = (eval_envs.task_indices == task_idx).nonzero(as_tuple=False).squeeze(-1)
+
+                if task_env_indices.numel() > 0:
+                    # Calculate the mean success and reward for this task's trials
+                    task_success_rate = (success_count_per_episode[task_env_indices]>0).float().mean().item()
+                    task_avg_reward = episode_returns[task_env_indices].mean().item()
+
+                    # Store metrics for logging
+                    info[f'eval/{real_id}/success_rate'] = task_success_rate
+                    info[f'eval/{real_id}/avg_reward'] = task_avg_reward
+            info['return'] = episode_returns.mean().item()
+            info['success_rate'] = (success_count_per_episode>0).float().mean().item()
         else:
             info = {}
 
@@ -488,14 +572,34 @@ def main(cfg):
     else:
         n_critic_obs = n_obs
 
+    multi_task = cfg.env.type == "mtbench"
+    num_tasks = getattr(envs, 'num_tasks', 1)
+
     if cfg.hyperparameters.normalize_env:
-        obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
-        critic_obs_normalizer = EmpiricalNormalization(
-            shape=n_critic_obs, device=device
-        )
+        if multi_task:
+            obs_normalizer = PerTaskEmpiricalNormalization(
+                num_tasks=num_tasks, shape=n_obs, device=device
+            )
+            critic_obs_normalizer = PerTaskEmpiricalNormalization(
+                num_tasks=num_tasks, shape=n_critic_obs, device=device
+            )
+        else:
+            obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
+            critic_obs_normalizer = EmpiricalNormalization(
+                shape=n_critic_obs, device=device
+            )
     else:
         obs_normalizer = nn.Identity()
         critic_obs_normalizer = nn.Identity()
+
+    if multi_task and cfg.env.get("normalize_reward", False):
+        reward_normalizer = PerTaskRewardNormalizer(
+            num_tasks=num_tasks,
+            gamma=cfg.hyperparameters.gamma,
+            device=device,
+        )
+    else:
+        reward_normalizer = None
 
     actor = Actor(
         n_obs=n_obs,
@@ -506,6 +610,7 @@ def main(cfg):
         use_norm=cfg.hyperparameters.use_actor_norm,
         layers=cfg.hyperparameters.num_actor_layers,
         min_std=cfg.hyperparameters.actor_min_std,
+        num_tasks=num_tasks,
         device=device,
     )
     old_actor = copy.deepcopy(actor)
@@ -537,7 +642,7 @@ def main(cfg):
         obs, critic_obs = envs.reset_with_critic_obs()
         critic_obs = torch.as_tensor(critic_obs, device=device, dtype=torch.float)
     else:
-        obs, _ = envs.reset()
+        obs = envs.reset()
         critic_obs = obs
 
     train_state = TrainState(
@@ -552,6 +657,7 @@ def main(cfg):
         critic_optimizer=q_optimizer,
         device=device,
         scaler=scaler,
+        reward_normalizer=reward_normalizer,
     )
 
     # print(
@@ -602,7 +708,7 @@ def main(cfg):
     start_time = None
     desc = ""
 
-    eval_interval = total_env_steps // cfg.hyperparameters.num_eval
+    eval_interval = cfg.hyperparameters.eval_interval
     stochastic_eval = cfg.env.get("stochastic_eval", False)
 
     while global_step < total_env_steps:
@@ -639,7 +745,7 @@ def main(cfg):
                 / (time.time() - start_time)
             )
             pbar.set_description(f"{speed: 4.4f} sps, " + desc)
-            with torch.inference_mode():
+            with torch.no_grad():
                 logs = {
                     "critic/qf_loss": logs_dict["qf_loss"].mean(),
                     "critic/qf_max": logs_dict["qf_max"].mean(),
@@ -676,6 +782,73 @@ def main(cfg):
                             .mean(),
                         }
                     )
+                if cfg.env.type == "mtbench":
+                    task_ids_flat = data["task_indices"].long()
+                    rewards_flat = data["rewards"].squeeze(-1)
+
+                    # Per-task batch reward statistics
+                    task_list = envs.task_list
+                    for task_idx in torch.unique(envs.task_indices):
+                        remapped = task_idx.item()
+                        real_id = task_list[remapped]
+                        mask = task_ids_flat == task_idx
+                        if mask.any():
+                            logs[f"train/task_{real_id}/reward_mean"] = rewards_flat[mask].mean()
+
+                    # Per-task success rates from episode infos
+                    # Use MTBench's pre-computed metrics, accumulate across
+                    # all steps (episode info only exists when envs finish)
+                    ep_success_rates = []
+                    task_success_rates = {}
+                    for info in infos:
+                        if 'episode' in info:
+                            ep_success_rates.append(info['episode']['average_environment_success_rate'])
+                            for task_idx in torch.unique(envs.task_indices):
+                                remapped = task_idx.item()
+                                real_id = task_list[remapped]
+                                key = f'task_{real_id}_success'
+                                if key in info['episode'] and info['episode'][key].numel() > 0:
+                                    rate = info['episode'][key].float().mean().item()
+                                    task_success_rates.setdefault(real_id, []).append(rate)
+                    if ep_success_rates:
+                        logs["train/success_rate"] = sum(ep_success_rates) / len(ep_success_rates)
+                        for real_id, rates in task_success_rates.items():
+                            logs[f"train/task_{real_id}/success_rate"] = sum(rates) / len(rates)
+
+                    # Per-task Q-value and KL diagnostics (subsampled for speed)
+                    diag_n = min(batch_size, data.shape[0])
+                    diag_idx = torch.randperm(data.shape[0], device=device)[:diag_n]
+                    diag_data = data[diag_idx]
+                    obs_diag = diag_data["observations"]
+                    critic_obs_diag = diag_data["critic_observations"]
+                    task_ids_diag = diag_data["task_indices"].long().squeeze()
+
+                    pi_diag, _, _, _ = train_state.actor(obs_diag, task_ids_diag)
+                    actions_diag = pi_diag.sample()
+                    qf_diag, _, _, _ = train_state.critic(critic_obs_diag, actions_diag)
+
+                    old_pi_diag, _, _, _ = train_state.old_actor(obs_diag, task_ids_diag)
+                    old_actions_diag = old_pi_diag.sample((4,)).clip(-1 + 1e-6, 1 - 1e-6)
+                    old_lp = old_pi_diag.log_prob(old_actions_diag).sum(-1).mean(0)
+                    new_lp = pi_diag.log_prob(old_actions_diag).sum(-1).mean(0)
+                    kl_diag = old_lp - new_lp
+
+                    # Also log GVE target stats per task
+                    gve_diag = diag_data["gve"].squeeze()
+
+                    for task_idx in torch.unique(envs.task_indices):
+                        remapped = task_idx.item()
+                        real_id = task_list[remapped]
+                        mask = task_ids_diag == task_idx
+                        if mask.any():
+                            logs[f"diag/task_{real_id}/qf_mean"] = qf_diag[mask].mean()
+                            logs[f"diag/task_{real_id}/qf_std"] = qf_diag[mask].std()
+                            logs[f"diag/task_{real_id}/kl_mean"] = kl_diag[mask].mean()
+                            logs[f"diag/task_{real_id}/kl_clip_frac"] = (kl_diag[mask] >= cfg.hyperparameters.kl_bound).float().mean()
+                            logs[f"diag/task_{real_id}/gve_mean"] = gve_diag[mask].mean()
+                            logs[f"diag/task_{real_id}/gve_std"] = gve_diag[mask].std()
+                            logs[f"diag/task_{real_id}/gve_max"] = gve_diag[mask].max()
+                            logs[f"diag/task_{real_id}/gve_min"] = gve_diag[mask].min()
 
                 if eval_interval > 0 and global_step % eval_interval == 0:
                     print(f"Evaluating at global step {global_step}")
@@ -700,7 +873,12 @@ def main(cfg):
                         "mtbench",
                     ]:
                         # NOTE: Hacky way of evaluating performance, but just works
-                        obs, _ = envs.reset()
+                        obs  = envs.reset()
+                        if cfg.env.type == "mtbench":
+                            # hacky way to reset the environment after evaluation
+                            eval_envs.env.reset_idx(torch.arange(eval_envs.num_envs, device=train_state.device))
+                            eval_envs.env.compute_observations()
+                            obs = eval_envs.reset()
                     logs["eval/avg_return"] = eval_avg_return
                     logs["eval/avg_length"] = eval_avg_length
                     for key, value in eval_info.items():
@@ -710,9 +888,16 @@ def main(cfg):
                             logs[f"eval/{key}"] = value.mean()
                         else:
                             logs[f"eval/{key}"] = value
-                    print(
-                        f"Eval return: {eval_avg_return:.2f}, length: {eval_avg_length:.2f}, env steps: {global_step * cfg.hyperparameters.num_envs * cfg.hyperparameters.num_steps} success rate: {eval_info.get('success', 0.0):.2f}"
-                    )
+                    if cfg.env.type == 'mtbench':
+                        print(
+                            f"Eval return: {eval_avg_return:.2f}\
+                                , env steps: {global_step * cfg.hyperparameters.num_envs * cfg.hyperparameters.num_steps} \
+                                    eval success rate: {eval_info.get('success_rate', 0.0):.2f}" \
+                        )
+                    else:
+                        print(
+                            f"Eval return: {eval_avg_return:.2f}, length: {eval_avg_length:.2f}, env steps: {global_step * cfg.hyperparameters.num_envs * cfg.hyperparameters.num_steps} success rate: {eval_info.get('success', 0.0):.2f}"
+                        )
             wandb.log(
                 {
                     "speed": speed,

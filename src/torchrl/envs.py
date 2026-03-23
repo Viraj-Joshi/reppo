@@ -91,6 +91,16 @@ def make_envs(cfg: DictConfig, device: torch.device, seed: int = None) -> tuple:
             partial_reset=cfg.env.partial_reset,
             device=device.type,
         )
+    elif cfg.env.type == "mtbench":
+        from src.env_utils.torch_wrappers.mtbench_env import MTBenchEnvWrapper
+        device_id = device.index if device.type == "cuda" else 0
+        envs = MTBenchEnvWrapper(
+            cfg.env.name,
+            device_id,
+            cfg.hyperparameters.num_envs,
+            seed,
+        )
+        return envs, envs
     else:
         raise ValueError(
             f"Unknown environment type: {cfg.env.type}. Supported types are 'humanoid_bench', 'isaaclab', 'maniskill', and 'mjx'."

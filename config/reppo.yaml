@@ -6,10 +6,10 @@ defaults:
 
 hyperparameters:
   # env and run settings (mostly don't touch)
-  total_time_steps: 50_000_000
+  total_time_steps: 100_000_000
   normalize_env: true
   max_episode_steps: 1000
-  eval_interval: 2
+  eval_interval: ${oc.select:env.eval_interval,2}
   num_eval: 20
 
   # optimization settings (seem very stable)
@@ -24,9 +24,9 @@ hyperparameters:
   lmbda_min: 0.50 # irrelevant if no exploration noise is added
 
   # batch settings (need tuning for MJX humanoid)
-  num_steps: 128
-  num_mini_batches: 128
-  num_envs: 1024
+  num_steps: ${oc.select:env.num_steps,128}
+  num_mini_batches: ${oc.select:env.num_minibatches,128}
+  num_envs: ${oc.select:env.num_envs,1024}
   num_epochs: 4
 
   # exploration settings (currently not touched)
@@ -36,7 +36,7 @@ hyperparameters:
 
   # critic architecture settings (need to be increased for MJX humanoid)
   critic_hidden_dim: 512
-  actor_hidden_dim: 512
+  actor_hidden_dim: 256
   vmin: ${env.vmin}
   vmax: ${env.vmax}
   num_bins: 151
@@ -51,7 +51,7 @@ hyperparameters:
   # actor architecture settings (seem stable)
   use_actor_norm: true
   num_actor_layers: 3
-  actor_min_std: 0.0
+  actor_min_std: 0.1
   use_actor_skip: False
 
   # actor & critic loss settings (seem remarkably stable)
@@ -64,7 +64,7 @@ hyperparameters:
   actor_kl_clip_mode: "clipped" # "full", "clipped", "kl_relu_clipped", "kl_bound_clipped", "value"
   ## entropy settings
   ent_start: 0.01
-  ent_target_mult: 0.5
+  ent_target_mult: 0.1
   update_entropy_lagrangian: true
   ## auxiliary loss settings
   aux_loss_mult: 1.0
@@ -72,7 +72,7 @@ hyperparameters:
 measure_burnin: 3
 
 name: "reppo"
-seed: 0
+seed: ${oc.select:env.seed,42}
 num_seeds: 1
 tune: false
 checkpoint_dir: null
@@ -80,7 +80,7 @@ num_trials: 10
 tags: ["experimental"]
 wandb:
   mode: "online" # set to online to activate wandb
-  entity: "viper_svg"
+  entity: ""
   project: "reppo"
 
 hydra:

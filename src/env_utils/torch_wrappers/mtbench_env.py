@@ -1,11 +1,10 @@
 from __future__ import annotations
+from omegaconf import OmegaConf
 
 import isaacgymenvs
 import torch
-from omegaconf import OmegaConf
 
-
-class MTBenchEnv:
+class MTBenchEnvWrapper:
     def __init__(
         self,
         task_name: str,
@@ -17,16 +16,22 @@ class MTBenchEnv:
         task_config = MTBENCH_MW2_CONFIG.copy()
         if task_name == "meta-world-v2-mt10":
             # MT-10 Setup
-            assert num_envs == 4096, "MT-10 only supports 4096 environments (for now)"
             self.num_tasks = 10
             task_config["env"]["tasks"] = [4, 16, 17, 18, 28, 31, 38, 40, 48, 49]
-            task_config["env"]["taskEnvCount"] = [410] * 6 + [409] * 4
+            # import ipdb; ipdb.set_trace()
+            base_count = num_envs // self.num_tasks
+            remainder = num_envs % self.num_tasks
+            subgroup_counts = [base_count + 1] * remainder + [base_count] * (self.num_tasks - remainder)
+            task_config["env"]["taskEnvCount"] = subgroup_counts
         elif task_name == "meta-world-v2-mt50":
             # MT-50 Setup
+            num_envs = num_envs
             self.num_tasks = 50
-            assert num_envs == 8192, "MT-50 only supports 8192 environments (for now)"
+            base_count = num_envs // self.num_tasks
+            remainder = num_envs % self.num_tasks
+            subgroup_counts = [base_count + 1] * remainder + [base_count] * (self.num_tasks - remainder)
             task_config["env"]["tasks"] = list(range(50))
-            task_config["env"]["taskEnvCount"] = [164] * 42 + [163] * 8  # 6888 + 1304
+            task_config["env"]["taskEnvCount"] = subgroup_counts
         else:
             raise ValueError(f"Unsupported task name: {task_name}")
         task_config["env"]["numEnvs"] = num_envs
@@ -48,6 +53,14 @@ class MTBenchEnv:
         )
 
         self.num_envs = num_envs
+        # Build mapping from raw task IDs to contiguous 0-based indices
+        raw_tasks = task_config["env"]["tasks"]
+        self.task_list = raw_tasks  # original task IDs for logging
+        max_raw_id = max(raw_tasks) + 1
+        self._task_id_remap = torch.full((max_raw_id,), -1, dtype=torch.long,
+                                          device=f"cuda:{device_id}")
+        for new_id, raw_id in enumerate(raw_tasks):
+            self._task_id_remap[raw_id] = new_id
         self.asymmetric_obs = False
         self.num_obs = self.env.observation_space.shape[0]
         assert self.num_obs == 39 + self.num_tasks, (
@@ -56,6 +69,11 @@ class MTBenchEnv:
         self.num_privileged_obs = 0
         self.num_actions = self.env.action_space.shape[0]
         self.max_episode_steps = self.env.max_episode_length
+
+    @property
+    def task_indices(self):
+        raw = self.env.task_indices.long()
+        return self._task_id_remap[raw]
 
     def reset(self) -> torch.Tensor:
         """Reset the environment."""
@@ -116,7 +134,7 @@ MTBENCH_MW2_CONFIG = {
         "cameraHeight": 1024,
         "sparse_reward": False,
         "termination_on_success": False,
-        "reward_scale": 1.0,
+        "reward_scale": 100.0,
         "fixed": False,
         "numObservations": None,
         "numActions": 4,
@@ -139,7 +157,7 @@ MTBENCH_MW2_CONFIG = {
             "bounce_threshold_velocity": 0.2,
             "max_depenetration_velocity": 1000.0,
             "default_buffer_size_multiplier": 10.0,
-            "max_gpu_contact_pairs": 1048576,
+            "max_gpu_contact_pairs": 2097152,
             "num_subscenes": 4,
             "contact_collection": 0,
         },
