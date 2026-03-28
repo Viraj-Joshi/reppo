@@ -6,10 +6,10 @@ asymmetric_obs: false
 vmin: 0
 vmax: 100
 num_envs: 24576
-num_mini_batches: 128
+num_mini_batches: 24
 num_steps: 32
 seed: 42
 
 task_embedding_dim: 32
 stochastic_eval: True
-eval_interval: 20 # ensure steps between eval interval is at least one episode otherwise train metrics will not log 
+eval_interval: 25 # ensure steps between eval interval is at least one episode otherwise train metrics will not log 

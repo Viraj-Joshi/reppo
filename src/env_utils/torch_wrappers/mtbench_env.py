@@ -115,7 +115,7 @@ MTBENCH_MW2_CONFIG = {
     "env": {
         "numEnvs": 1,
         "envSpacing": 1.5,
-        "episodeLength": 150,
+        "episodeLength": 250,
         "enableDebugVis": False,
         "clipObservations": 5.0,
         "clipActions": 1.0,
@@ -129,7 +129,7 @@ MTBENCH_MW2_CONFIG = {
         "taskEmbedding": True,
         "taskEmbeddingType": "one_hot",
         "seed": 42,
-        "cameraRenderingInterval": 5000,
+        "cameraRenderingInterval": 100,
         "cameraWidth": 1024,
         "cameraHeight": 1024,
         "sparse_reward": False,
