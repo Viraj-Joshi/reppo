@@ -100,6 +100,12 @@ def make_collect_fn(cfg: DictConfig, env):
     asymmetric_obs = env.asymmetric_obs
     multi_task = cfg.env.type == "mtbench"
     per_task_norm = multi_task and cfg.hyperparameters.normalize_env
+    num_tasks = getattr(env, 'num_tasks', 1) if multi_task else 0
+
+    def _per_task_normalize(normalizer, x, task_ids):
+        """Normalize non-one-hot dims, pass one-hot through unchanged."""
+        x_feat, x_onehot = x[:, :-num_tasks], x[:, -num_tasks:]
+        return torch.cat([normalizer(x_feat, task_ids), x_onehot], dim=-1)
 
     def collect_fn(
         train_state: TrainState,
@@ -110,11 +116,37 @@ def make_collect_fn(cfg: DictConfig, env):
         critic_obs = train_state.critic_obs
         task_ids = env.task_indices.long() if multi_task else None
 
-        for _ in range(cfg.hyperparameters.num_steps):
+        for step_i in range(cfg.hyperparameters.num_steps):
             with autocast():
                 if per_task_norm:
-                    norm_obs = train_state.normalizer(obs, task_ids)
-                    norm_critic_obs = train_state.critic_normalizer(critic_obs, task_ids)
+                    norm_obs = _per_task_normalize(train_state.normalizer, obs, task_ids)
+                    norm_critic_obs = _per_task_normalize(train_state.critic_normalizer, critic_obs, task_ids)
+
+                    # # === DEBUG: Check if one-hot encoding is preserved after normalization ===
+                    # if step_i == 0:
+                    #     raw_onehot = obs[:, -num_tasks:]
+                    #     normed_onehot = norm_obs[:, -num_tasks:]
+
+                    #     for env_i in range(min(3, obs.shape[0])):
+                    #         tid = task_ids[env_i].item()
+                    #         print(f"[DEBUG onehot] env={env_i} task_id={tid} "
+                    #               f"raw_onehot={raw_onehot[env_i].cpu().tolist()} "
+                    #               f"normed_onehot={normed_onehot[env_i].cpu().tolist()}")
+
+                    #     onehot_max = normed_onehot.max(dim=-1).values
+                    #     onehot_min = normed_onehot.min(dim=-1).values
+                    #     print(f"[DEBUG onehot summary] normed one-hot max: "
+                    #           f"mean={onehot_max.mean().item():.4f} std={onehot_max.std().item():.4f}")
+                    #     print(f"[DEBUG onehot summary] normed one-hot min: "
+                    #           f"mean={onehot_min.mean().item():.4f} std={onehot_min.std().item():.4f}")
+                    #     print(f"[DEBUG onehot summary] If preserved, max should be ~1.0 and min should be ~0.0")
+
+                    #     # Also verify normalizer shape excludes one-hot
+                    #     print(f"[DEBUG normalizer] obs dim={obs.shape[1]}, "
+                    #           f"normalizer shape={train_state.normalizer.shape}, "
+                    #           f"num_tasks={num_tasks}")
+                    # # === END DEBUG ===
+
                 else:
                     norm_obs = train_state.normalizer(obs)
                     norm_critic_obs = train_state.critic_normalizer(critic_obs)
@@ -150,7 +182,7 @@ def make_collect_fn(cfg: DictConfig, env):
                     _next_obs = next_obs
                     _next_critic_obs = next_critic_obs
                 if per_task_norm:
-                    norm_next_obs = train_state.normalizer(_next_obs, task_ids)
+                    norm_next_obs = _per_task_normalize(train_state.normalizer, _next_obs, task_ids)
                 else:
                     norm_next_obs = train_state.normalizer(_next_obs)
                 next_pi, _, temperature, _ = train_state.actor(norm_next_obs, task_ids)
@@ -159,8 +191,8 @@ def make_collect_fn(cfg: DictConfig, env):
                     next_actions.clip(-1 + 1e-6, 1 - 1e-6)
                 ).sum(-1)
                 if per_task_norm:
-                    norm_next_critic_obs = train_state.critic_normalizer(
-                        _next_critic_obs, task_ids
+                    norm_next_critic_obs = _per_task_normalize(
+                        train_state.critic_normalizer, _next_critic_obs, task_ids
                     )
                 else:
                     norm_next_critic_obs = train_state.critic_normalizer(_next_critic_obs)
@@ -402,6 +434,12 @@ def make_evaluate_fn(cfg: DictConfig, eval_envs):
     autocast = get_autocast_context(cfg)
     multi_task = cfg.env.type == "mtbench"
     per_task_norm = multi_task and cfg.hyperparameters.normalize_env
+    num_tasks = getattr(eval_envs, 'num_tasks', 1) if multi_task else 0
+
+    def _per_task_normalize(normalizer, x, task_ids):
+        """Normalize non-one-hot dims, pass one-hot through unchanged."""
+        x_feat, x_onehot = x[:, :-num_tasks], x[:, -num_tasks:]
+        return torch.cat([normalizer(x_feat, task_ids), x_onehot], dim=-1)
 
     # @torch.inference_mode()
     def evaluate(
@@ -440,7 +478,7 @@ def make_evaluate_fn(cfg: DictConfig, eval_envs):
         for i in range(eval_envs.max_episode_steps):
             with autocast():
                 if per_task_norm:
-                    obs = train_state.normalizer(obs, task_ids)
+                    obs = _per_task_normalize(train_state.normalizer, obs, task_ids)
                 else:
                     obs = train_state.normalizer(obs)
                 action_dist, det_actions, _, _ = train_state.actor(obs, task_ids)
@@ -578,10 +616,10 @@ def main(cfg):
     if cfg.hyperparameters.normalize_env:
         if multi_task:
             obs_normalizer = PerTaskEmpiricalNormalization(
-                num_tasks=num_tasks, shape=n_obs, device=device
+                num_tasks=num_tasks, shape=n_obs - num_tasks, device=device,
             )
             critic_obs_normalizer = PerTaskEmpiricalNormalization(
-                num_tasks=num_tasks, shape=n_critic_obs, device=device
+                num_tasks=num_tasks, shape=n_critic_obs - num_tasks, device=device,
             )
         else:
             obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
