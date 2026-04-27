@@ -7,33 +7,18 @@ import torch
 class MTBenchEnvWrapper:
     def __init__(
         self,
-        task_name: str,
+        tasks: list[int],
         device_id: int,
         num_envs: int,
         seed: int,
     ):
-        # NOTE: Currently, we only support Meta-World-v2 MT-10/MT-50 in MTBench
         task_config = MTBENCH_MW2_CONFIG.copy()
-        if task_name == "meta-world-v2-mt10":
-            # MT-10 Setup
-            self.num_tasks = 10
-            task_config["env"]["tasks"] = [4, 16, 17, 18, 28, 31, 38, 40, 48, 49]
-            # import ipdb; ipdb.set_trace()
-            base_count = num_envs // self.num_tasks
-            remainder = num_envs % self.num_tasks
-            subgroup_counts = [base_count + 1] * remainder + [base_count] * (self.num_tasks - remainder)
-            task_config["env"]["taskEnvCount"] = subgroup_counts
-        elif task_name == "meta-world-v2-mt50":
-            # MT-50 Setup
-            num_envs = num_envs
-            self.num_tasks = 50
-            base_count = num_envs // self.num_tasks
-            remainder = num_envs % self.num_tasks
-            subgroup_counts = [base_count + 1] * remainder + [base_count] * (self.num_tasks - remainder)
-            task_config["env"]["tasks"] = list(range(50))
-            task_config["env"]["taskEnvCount"] = subgroup_counts
-        else:
-            raise ValueError(f"Unsupported task name: {task_name}")
+        self.num_tasks = len(tasks)
+        task_config["env"]["tasks"] = tasks
+        base_count = num_envs // self.num_tasks
+        remainder = num_envs % self.num_tasks
+        subgroup_counts = [base_count + 1] * remainder + [base_count] * (self.num_tasks - remainder)
+        task_config["env"]["taskEnvCount"] = subgroup_counts
         task_config["env"]["numEnvs"] = num_envs
         task_config["env"]["numObservations"] = 39 + self.num_tasks
         task_config["env"]["seed"] = seed

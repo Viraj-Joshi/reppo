@@ -94,8 +94,9 @@ def make_envs(cfg: DictConfig, device: torch.device, seed: int = None) -> tuple:
     elif cfg.env.type == "mtbench":
         from src.env_utils.torch_wrappers.mtbench_env import MTBenchEnvWrapper
         device_id = device.index if device.type == "cuda" else 0
+        tasks = list(cfg.env.tasks)
         envs = MTBenchEnvWrapper(
-            cfg.env.name,
+            tasks,
             device_id,
             cfg.hyperparameters.num_envs,
             seed,

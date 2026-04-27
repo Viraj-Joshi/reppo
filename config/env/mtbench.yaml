@@ -1,5 +1,5 @@
 type: mtbench
-name: meta-world-v2-mt10
+name: meta-world-v2-mt50
 normalize_reward: True
 asymmetric_obs: false
 
@@ -8,8 +8,11 @@ vmax: 100
 num_envs: 24576
 num_mini_batches: 24
 num_steps: 32
-seed: 43
+seed: 45
+
+# Specify the task IDs to train on (e.g. MT-10: [4,16,17,18,28,31,38,40,48,49], MT-50: range(50))
+tasks: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49]
 
 task_embedding_dim: 32
 stochastic_eval: True
-eval_interval: 25 # ensure steps between eval interval is at least one episode otherwise train metrics will not log 
+eval_interval: 200 # ensure steps between eval interval is at least one episode otherwise train metrics will not log
